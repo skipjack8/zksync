@@ -1,4 +1,4 @@
-use web3::{transports::Http, types::Address};
+use web3::{transports::Http, types::Address, Web3};
 
 use zksync_crypto::Fr;
 use zksync_data_restore::{
@@ -9,27 +9,28 @@ use zksync_types::{AccountId, AccountMap, TokenId};
 
 use crate::external_commands::Contracts;
 
+use zksync_data_restore::contract::ZkSyncDeployedContract;
+
 pub async fn verify_restore(
     web3_url: &str,
-    available_block_chunk_sizes: Vec<usize>,
     contracts: &Contracts,
     fee_account_address: Address,
     acc_state_from_test_setup: AccountMap,
     tokens: Vec<TokenId>,
     root_hash: Fr,
 ) {
-    let transport = Http::new(web3_url).expect("http transport start");
+    let web3 = Web3::new(Http::new(web3_url).expect("http transport start"));
 
     let mut interactor = InMemoryStorageInteractor::new();
+    let contract = ZkSyncDeployedContract::version4(web3.eth(), contracts.contract);
     let mut driver = DataRestoreDriver::new(
-        transport,
+        web3,
         contracts.governance,
-        contracts.contract,
         ETH_BLOCKS_STEP,
         0,
-        available_block_chunk_sizes,
         true,
         Default::default(),
+        contract,
     );
 
     interactor.insert_new_account(AccountId(0), &fee_account_address);

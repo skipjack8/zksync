@@ -3,17 +3,19 @@ use std::time::Instant;
 // External imports
 use itertools::Itertools;
 // Workspace imports
-use zksync_types::{AccountId, AccountUpdate, ActionType, BlockNumber, Operation, Token, ZkSyncOp};
+use zksync_types::{AccountId, AccountUpdate, BlockNumber, Token, ZkSyncOp};
 // Local imports
 use self::records::{
     NewBlockEvent, NewStorageState, NewTokenEvent, NewZkSyncOp, StoredBlockEvent,
     StoredLastWatchedEthBlockNumber, StoredRollupOpsBlock, StoredStorageState, StoredZkSyncOp,
 };
-use crate::{
-    chain::{block::BlockSchema, operations::OperationsSchema, state::StateSchema},
-    tokens::TokensSchema,
-};
+
+use crate::chain::operations::OperationsSchema;
+use crate::{chain::state::StateSchema, tokens::TokensSchema};
 use crate::{QueryResult, StorageProcessor};
+use zksync_types::aggregated_operations::{
+    AggregatedActionType, AggregatedOperation, BlocksCommitOperation, BlocksExecuteOperation,
+};
 
 pub mod records;
 
@@ -27,29 +29,41 @@ pub struct DataRestoreSchema<'a, 'c>(pub &'a mut StorageProcessor<'c>);
 impl<'a, 'c> DataRestoreSchema<'a, 'c> {
     pub async fn save_block_operations(
         &mut self,
-        commit_op: Operation,
-        verify_op: Operation,
+        commit_op: BlocksCommitOperation,
+        execute_op: BlocksExecuteOperation,
     ) -> QueryResult<()> {
         let start = Instant::now();
         let new_state = self.new_storage_state("None");
         let mut transaction = self.0.start_transaction().await?;
 
-        let commit_op = BlockSchema(&mut transaction)
-            .execute_operation(commit_op)
+        OperationsSchema(&mut transaction)
+            .store_aggregated_action(AggregatedOperation::CommitBlocks(commit_op.clone()))
             .await?;
-        let verify_op = BlockSchema(&mut transaction)
-            .execute_operation(verify_op)
+        OperationsSchema(&mut transaction)
+            .store_aggregated_action(AggregatedOperation::ExecuteBlocks(execute_op.clone()))
             .await?;
         // The state is expected to be updated, so it's necessary
         // to do it here.
-        StateSchema(&mut transaction)
-            .apply_state_update(verify_op.block.block_number)
-            .await?;
+        for block in commit_op.blocks.iter() {
+            StateSchema(&mut transaction)
+                .apply_state_update(block.block_number)
+                .await?;
+        }
+
         OperationsSchema(&mut transaction)
-            .confirm_operation(commit_op.block.block_number, ActionType::COMMIT)
+            .confirm_aggregated_operations(
+                commit_op.blocks.first().unwrap().block_number,
+                commit_op.blocks.last().unwrap().block_number,
+                AggregatedActionType::CommitBlocks,
+            )
             .await?;
+
         OperationsSchema(&mut transaction)
-            .confirm_operation(verify_op.block.block_number, ActionType::VERIFY)
+            .confirm_aggregated_operations(
+                execute_op.blocks.first().unwrap().block_number,
+                execute_op.blocks.last().unwrap().block_number,
+                AggregatedActionType::ExecuteBlocks,
+            )
             .await?;
 
         DataRestoreSchema(&mut transaction)
@@ -234,17 +248,17 @@ impl<'a, 'c> DataRestoreSchema<'a, 'c> {
         &mut self,
         last_committed_block: BlockNumber,
         last_verified_block: BlockNumber,
+        last_executed_block: BlockNumber,
     ) -> QueryResult<()> {
         let start = Instant::now();
-        // Withdraw ops counter is set equal to the `verify` ops counter
-        // since we assume that we've sent a withdraw for every `verify` op.
+
         sqlx::query!(
             "UPDATE eth_parameters
-            SET commit_ops = $1, verify_ops = $2, withdraw_ops = $3
+            SET last_committed_block = $1, last_verified_block = $2, last_executed_block = $3
             WHERE id = true",
             *last_committed_block as i64,
             *last_verified_block as i64,
-            *last_verified_block as i64
+            *last_executed_block as i64
         )
         .execute(self.0.conn())
         .await?;
@@ -322,8 +336,8 @@ impl<'a, 'c> DataRestoreSchema<'a, 'c> {
 
         for event in events.iter() {
             sqlx::query!(
-                "INSERT INTO data_restore_events_state (block_type, transaction_hash, block_num) VALUES ($1, $2, $3)",
-                event.block_type, event.transaction_hash, event.block_num
+                "INSERT INTO data_restore_events_state (block_type, transaction_hash, block_num, contract_version) VALUES ($1, $2, $3, $4)",
+                event.block_type, event.transaction_hash, event.block_num, event.contract_version
             )
             .execute(transaction.conn())
             .await?;

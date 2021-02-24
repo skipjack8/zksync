@@ -36,16 +36,17 @@ impl UniswapTokenWatcher {
         // TODO https://linear.app/matterlabs/issue/ZKS-413/support-full-version-of-graphql-for-tokenvalidator
         let start = Instant::now();
 
-        let query = format!("{{token(id: \"{:#x}\"){{tradeVolumeUSD}}}}", address);
+        let query = format!("{{token(id: \"{:#x}\"){{untrackedVolumeUSD}}}}", address);
 
-        let request = self.client.post(&self.addr).json(&serde_json::json!({
-            "query": query.clone(),
-        }));
-        let api_request_future = tokio::time::timeout(REQUEST_TIMEOUT, request.send());
-
-        let response: GraphqlResponse = api_request_future
+        let response = self
+            .client
+            .post(&self.addr)
+            .json(&serde_json::json!({
+                "query": query.clone(),
+            }))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
             .await
-            .map_err(|_| anyhow::format_err!("Uniswap API request timeout"))?
             .map_err(|err| anyhow::format_err!("Uniswap API request failed: {}", err))?
             .json::<GraphqlResponse>()
             .await?;
@@ -53,7 +54,7 @@ impl UniswapTokenWatcher {
         metrics::histogram!("ticker.uniswap_watcher.get_market_volume", start.elapsed());
 
         let volume = if let Some(token) = response.data.token {
-            token.trade_volume_usd.parse()?
+            token.untracked_volume_usd.parse()?
         } else {
             BigDecimal::zero()
         };
@@ -81,8 +82,9 @@ pub struct GraphqlTokenResponse {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TokenResponse {
-    #[serde(rename = "tradeVolumeUSD")]
-    pub trade_volume_usd: String,
+    /// Total amount swapped all time in token pair stored in USD, no minimum liquidity threshold.
+    #[serde(rename = "untrackedVolumeUSD")]
+    pub untracked_volume_usd: String,
 }
 
 #[async_trait::async_trait]

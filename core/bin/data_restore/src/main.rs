@@ -6,6 +6,8 @@ use zksync_crypto::convert::FeConvert;
 use zksync_storage::ConnectionPool;
 use zksync_types::{Address, H256};
 
+use web3::Web3;
+use zksync_data_restore::contract::ZkSyncDeployedContract;
 use zksync_data_restore::{
     add_tokens_to_storage, data_restore_driver::DataRestoreDriver,
     database_storage_interactor::DatabaseStorageInteractor, END_ETH_BLOCKS_OFFSET, ETH_BLOCKS_STEP,
@@ -50,6 +52,7 @@ pub struct ContractsConfig {
     governance_addr: Address,
     genesis_tx_hash: H256,
     contract_addr: Address,
+    upgrade_gatekeeper_addr: Address,
     available_block_chunk_sizes: Vec<usize>,
 }
 
@@ -69,6 +72,7 @@ impl ContractsConfig {
             governance_addr: contracts_opts.governance_addr,
             genesis_tx_hash: contracts_opts.genesis_tx_hash,
             contract_addr: contracts_opts.contract_addr,
+            upgrade_gatekeeper_addr: contracts_opts.upgrade_gatekeeper_addr,
             available_block_chunk_sizes: chain_opts.state_keeper.block_chunk_sizes,
         }
     }
@@ -100,16 +104,16 @@ async fn main() {
         None
     };
     let storage = connection_pool.access_storage().await.unwrap();
-
+    let web3 = Web3::new(transport);
+    let contract = ZkSyncDeployedContract::version4(web3.eth(), config.contract_addr);
     let mut driver = DataRestoreDriver::new(
-        transport,
+        web3,
         config.governance_addr,
-        config.contract_addr,
         ETH_BLOCKS_STEP,
         END_ETH_BLOCKS_OFFSET,
-        config.available_block_chunk_sizes.clone(),
         finite_mode,
         final_hash,
+        contract,
     );
 
     let mut interactor = DatabaseStorageInteractor::new(storage);

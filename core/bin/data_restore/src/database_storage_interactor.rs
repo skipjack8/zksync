@@ -1,10 +1,10 @@
 // Built-in deps
 use std::str::FromStr;
 // Workspace deps
-use zksync_crypto::proof::EncodedProofPlonk;
 use zksync_storage::{data_restore::records::NewBlockEvent, StorageProcessor};
 use zksync_types::{
-    AccountId, Action, BlockNumber, Operation, Token, TokenGenesisListItem, TokenId,
+    aggregated_operations::{BlocksCommitOperation, BlocksExecuteOperation},
+    AccountId, BlockNumber, Token, TokenGenesisListItem, TokenId,
     {block::Block, AccountUpdate, AccountUpdates, ZkSyncOp},
 };
 
@@ -83,18 +83,13 @@ impl StorageInteractor for DatabaseStorageInteractor<'_> {
             .await
             .expect("Failed initializing a DB transaction");
 
-        let commit_op = Operation {
-            action: Action::Commit,
-            block: block.clone(),
-            id: None,
+        let commit_aggregated_operation = BlocksCommitOperation {
+            last_committed_block: block.clone(),
+            blocks: vec![block.clone()],
         };
 
-        let verify_op = Operation {
-            action: Action::Verify {
-                proof: Box::new(EncodedProofPlonk::default()),
-            },
-            block: block.clone(),
-            id: None,
+        let execute_aggregated_operation = BlocksExecuteOperation {
+            blocks: vec![block.clone()],
         };
 
         transaction
@@ -106,9 +101,16 @@ impl StorageInteractor for DatabaseStorageInteractor<'_> {
 
         transaction
             .data_restore_schema()
-            .save_block_operations(commit_op, verify_op)
+            .save_block_operations(commit_aggregated_operation, execute_aggregated_operation)
             .await
             .expect("Cant execute verify operation");
+
+        transaction
+            .chain()
+            .block_schema()
+            .save_block(block)
+            .await
+            .expect("Unable to save block");
 
         transaction
             .commit()
@@ -262,9 +264,14 @@ impl StorageInteractor for DatabaseStorageInteractor<'_> {
             .await
             .expect("Can't get the last verified block");
 
+        // Use new schema to get `last_committed`, `last_verified_block` and `last_executed_block` (ZKS-427).
         self.storage
             .data_restore_schema()
-            .initialize_eth_stats(last_committed_block, last_verified_block)
+            .initialize_eth_stats(
+                last_committed_block,
+                last_verified_block,
+                last_verified_block,
+            )
             .await
             .expect("Can't update the eth_stats table")
     }

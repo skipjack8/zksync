@@ -12,6 +12,23 @@ All notable changes to the core components will be documented in this file.
 
 ### Fixed
 
+## Release 2021-02-19
+
+### Removed
+
+### Changed
+
+- The token name is now set for each scenario separately instead of the network section of the loadtest configuration.
+- Rejected transactions are now stored in the database for 2 weeks only.
+
+### Added
+
+- Added a stressing dev fee ticker scenario to the loadtest.
+- Added a `--sloppy` mode to the `dev-fee-ticker-server` to simulate bad networks with the random delays and fails.
+- Possibility to use CREATE2 ChangePubKey and Transfer in a single batch.
+
+### Fixed
+
 ## Release 2021-02-02
 
 ### Removed

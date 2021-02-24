@@ -1,24 +1,26 @@
 // External deps
 use web3::{
     contract::Contract,
-    types::{H160, H256},
+    types::{BlockNumber as Web3BlockNumber, FilterBuilder, Log, H160, H256},
     Transport, Web3,
 };
 // Workspace deps
-use zksync_contracts::{governance_contract, zksync_contract};
+use zksync_contracts::{governance_contract, upgrade_gatekeeper};
 use zksync_crypto::Fr;
 
 use zksync_types::{AccountId, AccountMap, AccountUpdate, BlockNumber};
 // Local deps
-use crate::storage_interactor::StorageInteractor;
 use crate::{
-    contract_functions::{get_genesis_account, get_total_verified_blocks},
+    contract::{get_genesis_account, ZkSyncDeployedContract},
     eth_tx_helpers::get_ethereum_transaction,
     events_state::EventsState,
     rollup_ops::RollupOpsBlock,
+    storage_interactor::StorageInteractor,
     tree_state::TreeState,
 };
-use serde::export::PhantomData;
+use ethabi::Address;
+
+use std::marker::PhantomData;
 
 /// Storage state update:
 /// - None - The state is updated completely last time - start from fetching the new events
@@ -51,7 +53,7 @@ pub struct DataRestoreDriver<T: Transport, I> {
     /// Provides Ethereum Governance contract unterface
     pub governance_contract: (ethabi::Contract, Contract<T>),
     /// Provides Ethereum Rollup contract unterface
-    pub zksync_contract: (ethabi::Contract, Contract<T>),
+    pub zksync_contract: ZkSyncDeployedContract<T>,
     /// Rollup contract events state
     pub events_state: EventsState,
     /// Rollup accounts state
@@ -60,8 +62,6 @@ pub struct DataRestoreDriver<T: Transport, I> {
     pub eth_blocks_step: u64,
     /// The distance to the last ethereum block
     pub end_eth_blocks_offset: u64,
-    /// Available block chunk sizes
-    pub available_block_chunk_sizes: Vec<usize>,
     /// Finite mode flag. In finite mode, driver will only work until
     /// amount of restored blocks will become equal to amount of known
     /// verified blocks. After that, it will stop.
@@ -83,23 +83,22 @@ where
     ///
     /// * `web3_transport` - Web3 provider transport
     /// * `governance_contract_eth_addr` - Governance contract address
-    /// * `zksync_contract_eth_addr` - Rollup contract address
     /// * `eth_blocks_step` - The step distance of viewing events in the ethereum blocks
     /// * `end_eth_blocks_offset` - The distance to the last ethereum block
+    /// * `finite_mode` - Finite mode flag.
+    /// * `final_hash` - Hash of the last block which we want to restore
+    /// * `zksync_contract` - Current deployed zksync contract
     ///
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        web3_transport: T,
+        web3: Web3<T>,
         governance_contract_eth_addr: H160,
-        zksync_contract_eth_addr: H160,
         eth_blocks_step: u64,
         end_eth_blocks_offset: u64,
-        available_block_chunk_sizes: Vec<usize>,
         finite_mode: bool,
         final_hash: Option<Fr>,
+        zksync_contract: ZkSyncDeployedContract<T>,
     ) -> Self {
-        let web3 = Web3::new(web3_transport);
-
         let governance_contract = {
             let abi = governance_contract();
             (
@@ -108,18 +107,9 @@ where
             )
         };
 
-        let zksync_contract = {
-            let abi = zksync_contract();
-            (
-                abi.clone(),
-                Contract::new(web3.eth(), zksync_contract_eth_addr, abi),
-            )
-        };
-
         let events_state = EventsState::default();
 
-        let tree_state = TreeState::new(available_block_chunk_sizes.clone());
-
+        let tree_state = TreeState::new();
         Self {
             web3,
             governance_contract,
@@ -128,11 +118,36 @@ where
             tree_state,
             eth_blocks_step,
             end_eth_blocks_offset,
-            available_block_chunk_sizes,
             finite_mode,
             final_hash,
             phantom_data: Default::default(),
         }
+    }
+
+    pub async fn get_gatekeeper_logs(
+        &self,
+        upgrade_gatekeeper_contract_address: Address,
+    ) -> anyhow::Result<Vec<Log>> {
+        let gatekeeper_abi = upgrade_gatekeeper();
+        let upgrade_contract_event = gatekeeper_abi
+            .event("UpgradeComplete")
+            .expect("Upgrade Gatekeeper contract abi error")
+            .signature();
+
+        let filter = FilterBuilder::default()
+            .address(vec![upgrade_gatekeeper_contract_address])
+            .from_block(Web3BlockNumber::Earliest)
+            .to_block(Web3BlockNumber::Latest)
+            .topics(Some(vec![upgrade_contract_event]), None, None, None)
+            .build();
+
+        let result = self
+            .web3
+            .eth()
+            .logs(filter)
+            .await
+            .map_err(|e| anyhow::format_err!("No new logs: {}", e))?;
+        Ok(result)
     }
 
     /// Sets the 'genesis' state.
@@ -184,7 +199,6 @@ where
             account_map,
             current_unprocessed_priority_op,
             AccountId(fee_acc_num),
-            self.available_block_chunk_sizes.clone(),
         );
 
         vlog::info!("Genesis tree root hash: {:?}", tree_state.root_hash());
@@ -208,7 +222,6 @@ where
             tree_state.account_map,           // account map
             tree_state.unprocessed_prior_ops, // unprocessed priority op
             tree_state.fee_acc_id,            // fee account
-            self.available_block_chunk_sizes.clone(),
         );
         match state {
             StorageUpdateState::Events => {
@@ -225,16 +238,16 @@ where
             }
             StorageUpdateState::None => {}
         }
-        let total_verified_blocks = get_total_verified_blocks(&self.zksync_contract).await;
+        let total_verified_blocks = self.zksync_contract.get_total_verified_blocks().await;
+
         let last_verified_block = self.tree_state.state.block_number;
         vlog::info!(
-            "State has been loaded\nProcessed {:?} blocks of total {:?} verified on contract\nRoot hash: {:?}\n",
+            "State has been loaded\nProcessed {:?} blocks on contract\nRoot hash: {:?}\n",
             last_verified_block,
-            total_verified_blocks,
             self.tree_state.root_hash()
         );
 
-        self.finite_mode && (total_verified_blocks == last_verified_block)
+        self.finite_mode && (total_verified_blocks == *last_verified_block)
     }
 
     /// Activates states updates
@@ -242,7 +255,7 @@ where
         let mut last_watched_block: u64 = self.events_state.last_watched_eth_block_number;
         let mut final_hash_was_found = false;
         loop {
-            vlog::debug!("Last watched ethereum block: {:?}", last_watched_block);
+            vlog::info!("Last watched ethereum block: {:?}", last_watched_block);
 
             // Update events
             if self.update_events_state(interactor).await {
@@ -254,7 +267,8 @@ where
                     self.update_tree_state(interactor, new_ops_blocks).await;
 
                     let total_verified_blocks =
-                        get_total_verified_blocks(&self.zksync_contract).await;
+                        self.zksync_contract.get_total_verified_blocks().await;
+
                     let last_verified_block = self.tree_state.state.block_number;
 
                     // We must update the Ethereum stats table to match the actual stored state
@@ -275,16 +289,15 @@ where
                     if let Some(root_hash) = self.final_hash {
                         if root_hash == self.tree_state.root_hash() {
                             final_hash_was_found = true;
-
                             vlog::info!(
                                 "Correct expected root hash was met on the block {} out of {}",
                                 *last_verified_block,
-                                *total_verified_blocks
+                                total_verified_blocks
                             );
                         }
                     }
 
-                    if self.finite_mode && last_verified_block == total_verified_blocks {
+                    if self.finite_mode && *last_verified_block == total_verified_blocks {
                         // Check if the final hash was found and panic otherwise.
                         if self.final_hash.is_some() && !final_hash_was_found {
                             panic!("Final hash was not met during the state restoring process");
@@ -297,6 +310,7 @@ where
             }
 
             if last_watched_block == self.events_state.last_watched_eth_block_number {
+                vlog::info!("sleep block");
                 std::thread::sleep(std::time::Duration::from_secs(5));
             } else {
                 last_watched_block = self.events_state.last_watched_eth_block_number;
@@ -318,7 +332,6 @@ where
             )
             .await
             .expect("Updating events state: cant update events state");
-
         interactor
             .save_events_state(
                 &block_events,
@@ -326,8 +339,6 @@ where
                 last_watched_eth_block_number,
             )
             .await;
-
-        vlog::debug!("Updated events storage");
 
         !block_events.is_empty()
     }
@@ -376,15 +387,26 @@ where
     pub async fn get_new_operation_blocks_from_events(&mut self) -> Vec<RollupOpsBlock> {
         let mut blocks = Vec::new();
 
+        let mut last_event_tx_hash = None;
         for event in self
             .events_state
             .get_only_verified_committed_events()
             .iter()
         {
-            let block = RollupOpsBlock::get_rollup_ops_block(&self.web3, &event)
+            // We use an aggregated block in contracts, which means that several BlockEvent can include the same tx_hash,
+            // but for correct restore we need to generate RollupBlocks from this tx only once.
+            // These blocks go one after the other, and checking only the last transaction hash is safe
+            if let Some(tx) = last_event_tx_hash {
+                if tx == event.transaction_hash {
+                    continue;
+                }
+            }
+
+            let block = RollupOpsBlock::get_rollup_ops_blocks(&self.web3, &event)
                 .await
                 .expect("Cant get new operation blocks from events");
-            blocks.push(block);
+            blocks.extend(block);
+            last_event_tx_hash = Some(event.transaction_hash);
         }
 
         blocks

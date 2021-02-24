@@ -1,6 +1,5 @@
 use crate::rollup_ops::RollupOpsBlock;
 use anyhow::format_err;
-use web3::types::{Address, H256};
 use zksync_crypto::Fr;
 use zksync_state::{
     handler::TxHandler,
@@ -12,7 +11,7 @@ use zksync_types::operations::ZkSyncOp;
 use zksync_types::priority_ops::PriorityOp;
 use zksync_types::priority_ops::ZkSyncPriorityOp;
 use zksync_types::tx::{ChangePubKey, Close, ForcedExit, Transfer, Withdraw, ZkSyncTx};
-use zksync_types::{AccountId, AccountMap, AccountUpdates, BlockNumber};
+use zksync_types::{AccountId, AccountMap, AccountUpdates, Address, BlockNumber, H256};
 
 /// Rollup accounts states
 pub struct TreeState {
@@ -22,18 +21,21 @@ pub struct TreeState {
     pub current_unprocessed_priority_op: u64,
     /// The last fee account address
     pub last_fee_account_address: Address,
-    /// Available block chunk sizes
-    pub available_block_chunk_sizes: Vec<usize>,
+}
+
+impl Default for TreeState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TreeState {
     /// Returns empty self state
-    pub fn new(available_block_chunk_sizes: Vec<usize>) -> Self {
+    pub fn new() -> Self {
         Self {
             state: ZkSyncState::empty(),
             current_unprocessed_priority_op: 0,
             last_fee_account_address: Address::default(),
-            available_block_chunk_sizes,
         }
     }
 
@@ -51,7 +53,6 @@ impl TreeState {
         accounts: AccountMap,
         current_unprocessed_priority_op: u64,
         fee_account: AccountId,
-        available_block_chunk_sizes: Vec<usize>,
     ) -> Self {
         let state = ZkSyncState::from_acc_map(accounts, current_block);
         let last_fee_account_address = state
@@ -62,7 +63,6 @@ impl TreeState {
             state,
             current_unprocessed_priority_op,
             last_fee_account_address,
-            available_block_chunk_sizes,
         }
     }
 
@@ -132,11 +132,11 @@ impl TreeState {
                     let from = self
                         .state
                         .get_account(op.from)
-                        .ok_or_else(|| format_err!("Nonexistent account"))?;
+                        .ok_or_else(|| format_err!("TransferFail: Nonexistent account"))?;
                     let to = self
                         .state
                         .get_account(op.to)
-                        .ok_or_else(|| format_err!("Nonexistent account"))?;
+                        .ok_or_else(|| format_err!("TransferFail: Nonexistent account"))?;
                     op.tx.from = from.address;
                     op.tx.to = to.address;
                     op.tx.nonce = from.nonce;
@@ -288,7 +288,7 @@ impl TreeState {
 
         let fee_account_address = self
             .get_account(ops_block.fee_account)
-            .ok_or_else(|| format_err!("Nonexistent account"))?
+            .ok_or_else(|| format_err!("Nonexistent fee account"))?
             .address;
 
         let fee_updates = self.state.collect_fee(&fees, ops_block.fee_account);
@@ -299,7 +299,7 @@ impl TreeState {
         // As we restoring an already executed block, this value isn't important.
         let gas_limit = 0.into();
 
-        let block = Block::new_from_available_block_sizes(
+        let block = Block::new_with_current_chunk_size(
             ops_block.block_num,
             self.state.root_hash(),
             ops_block.fee_account,
@@ -308,9 +308,10 @@ impl TreeState {
                 last_unprocessed_prior_op,
                 self.current_unprocessed_priority_op,
             ),
-            &self.available_block_chunk_sizes,
             gas_limit,
             gas_limit,
+            H256::default(),
+            0,
         );
 
         *self.state.block_number += 1;
@@ -429,6 +430,7 @@ impl TreeState {
 
 #[cfg(test)]
 mod test {
+    use crate::contract::default::get_rollup_ops_from_data;
     use crate::rollup_ops::RollupOpsBlock;
     use crate::tree_state::TreeState;
     use num::BigUint;
@@ -453,8 +455,7 @@ mod test {
             account_id: AccountId(0),
         }));
         let pub_data1 = op1.public_data();
-        let ops1 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data1).expect("cant get ops from data 1");
+        let ops1 = get_rollup_ops_from_data(&pub_data1).expect("cant get ops from data 1");
         let block1 = RollupOpsBlock {
             block_num: BlockNumber(1),
             ops: ops1,
@@ -470,6 +471,7 @@ mod test {
             BigUint::from(20u32),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op2 = ZkSyncOp::Withdraw(Box::new(WithdrawOp {
@@ -477,8 +479,7 @@ mod test {
             account_id: AccountId(0),
         }));
         let pub_data2 = op2.public_data();
-        let ops2 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data2).expect("cant get ops from data 2");
+        let ops2 = get_rollup_ops_from_data(&pub_data2).expect("cant get ops from data 2");
         let block2 = RollupOpsBlock {
             block_num: BlockNumber(2),
             ops: ops2,
@@ -494,6 +495,7 @@ mod test {
             BigUint::from(40u32),
             BigUint::from(1u32),
             Nonce(3),
+            Default::default(),
             None,
         );
         let op3 = ZkSyncOp::TransferToNew(Box::new(TransferToNewOp {
@@ -502,8 +504,7 @@ mod test {
             to: AccountId(1),
         }));
         let pub_data3 = op3.public_data();
-        let ops3 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data3).expect("cant get ops from data 3");
+        let ops3 = get_rollup_ops_from_data(&pub_data3).expect("cant get ops from data 3");
         let block3 = RollupOpsBlock {
             block_num: BlockNumber(3),
             ops: ops3,
@@ -519,6 +520,7 @@ mod test {
             BigUint::from(19u32),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op4 = ZkSyncOp::Transfer(Box::new(TransferOp {
@@ -527,8 +529,7 @@ mod test {
             to: AccountId(0),
         }));
         let pub_data4 = op4.public_data();
-        let ops4 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data4).expect("cant get ops from data 4");
+        let ops4 = get_rollup_ops_from_data(&pub_data4).expect("cant get ops from data 4");
         let block4 = RollupOpsBlock {
             block_num: BlockNumber(4),
             ops: ops4,
@@ -544,6 +545,7 @@ mod test {
             TokenId(1),
             BigUint::from(1u32),
             Nonce(2),
+            Default::default(),
             None,
             None,
         );
@@ -552,8 +554,7 @@ mod test {
             account_id: AccountId(0),
         }));
         let pub_data5 = op5.public_data();
-        let ops5 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data5).expect("cant get ops from data 5");
+        let ops5 = get_rollup_ops_from_data(&pub_data5).expect("cant get ops from data 5");
         let block5 = RollupOpsBlock {
             block_num: BlockNumber(5),
             ops: ops5,
@@ -571,8 +572,7 @@ mod test {
             withdraw_amount: Some(BigUint::from(980u32).into()),
         }));
         let pub_data6 = op6.public_data();
-        let ops6 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data6).expect("cant get ops from data 5");
+        let ops6 = get_rollup_ops_from_data(&pub_data6).expect("cant get ops from data 5");
         let block6 = RollupOpsBlock {
             block_num: BlockNumber(5),
             ops: ops6,
@@ -586,6 +586,7 @@ mod test {
             TokenId(1),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op7 = ZkSyncOp::ForcedExit(Box::new(ForcedExitOp {
@@ -594,8 +595,7 @@ mod test {
             withdraw_amount: Some(BigUint::from(960u32).into()),
         }));
         let pub_data7 = op7.public_data();
-        let ops7 =
-            RollupOpsBlock::get_rollup_ops_from_data(&pub_data7).expect("cant get ops from data 5");
+        let ops7 = get_rollup_ops_from_data(&pub_data7).expect("cant get ops from data 5");
         let block7 = RollupOpsBlock {
             block_num: BlockNumber(7),
             ops: ops7,
@@ -619,7 +619,7 @@ mod test {
         //     fee_account: AccountId(0),
         // };
         //
-        let mut tree = TreeState::new(vec![50]);
+        let mut tree = TreeState::new();
         tree.update_tree_states_from_ops_block(&block1)
             .expect("Cant update state from block 1");
         let zero_acc = tree.get_account(AccountId(0)).expect("Cant get 0 account");
@@ -693,6 +693,7 @@ mod test {
             BigUint::from(20u32),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op2 = ZkSyncOp::Withdraw(Box::new(WithdrawOp {
@@ -709,6 +710,7 @@ mod test {
             BigUint::from(40u32),
             BigUint::from(1u32),
             Nonce(3),
+            Default::default(),
             None,
         );
         let op3 = ZkSyncOp::TransferToNew(Box::new(TransferToNewOp {
@@ -726,6 +728,7 @@ mod test {
             BigUint::from(19u32),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op4 = ZkSyncOp::Transfer(Box::new(TransferOp {
@@ -744,6 +747,7 @@ mod test {
             TokenId(1),
             BigUint::from(1u32),
             Nonce(2),
+            Default::default(),
             None,
             None,
         );
@@ -770,6 +774,7 @@ mod test {
             TokenId(1),
             BigUint::from(1u32),
             Nonce(1),
+            Default::default(),
             None,
         );
         let op7 = ZkSyncOp::ForcedExit(Box::new(ForcedExitOp {
@@ -788,15 +793,14 @@ mod test {
         pub_data.extend_from_slice(&pub_data6);
         pub_data.extend_from_slice(&pub_data7);
 
-        let ops = RollupOpsBlock::get_rollup_ops_from_data(pub_data.as_slice())
-            .expect("cant get ops from data 1");
+        let ops = get_rollup_ops_from_data(pub_data.as_slice()).expect("cant get ops from data 1");
         let block = RollupOpsBlock {
             block_num: BlockNumber(1),
             ops,
             fee_account: AccountId(0),
         };
 
-        let mut tree = TreeState::new(vec![50]);
+        let mut tree = TreeState::new();
         tree.update_tree_states_from_ops_block(&block)
             .expect("Cant update state from block");
 
